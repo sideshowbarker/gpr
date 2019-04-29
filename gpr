@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+import json
+import re
+import subprocess
+import sys
+from six.moves import urllib
+
+"""Checks out a GitHub pull-request branch
+
+This script is intended to make it easier for project maintainers to check
+out GitHub PR branches--including ones from external contributor forks--so
+the maintainers can push changes to the branches and thus back to the PRs.
+
+It takes as its sole argument either a GitHub PR URL or just a PR number,
+then into the clone where it's run, checks out the corresponding branch
+from the PR contributor's fork.
+
+Fed just a PR number, it assumes you have an `upstream` or `origin` remote,
+and uses that remote's URL to infer which repo the PR was submitted to.
+
+If the remote has a GitHub SSH URL, then it uses an SSH URL for the fork,
+which assumes you have write access to the contributor's branch.
+"""
+
+
+def main():
+    git("rev-parse")  # exit with git error message if not in a git repo
+    if len(sys.argv) == 1:
+        usage()
+    upstreamOrOrginUrl = (git("config", "remote.upstream.url")
+                          or git("config", "remote.origin.url")) \
+        .decode("utf-8").strip()
+    ghProtocolIsSsh = False
+    ghOrgSlashRepo = None
+    if upstreamOrOrginUrl.startswith("git@github.com:"):
+        ghProtocolIsSsh = True
+        ghOrgSlashRepo = upstreamOrOrginUrl[15:][:-4]
+    elif upstreamOrOrginUrl.startswith("https://github.com/"):
+        ghOrgSlashRepo = upstreamOrOrginUrl[19:][:-4]
+    prNumber = sys.argv[1]
+    if sys.argv[1].startswith("http"):
+        prNumber = re.match(r'https://github.com/.+/pull/([0-9]+)',
+                            sys.argv[1])[1]
+        prUrlParts = sys.argv[1].split('/')
+        ghOrgSlashRepo = "%s/%s" % (prUrlParts[3], prUrlParts[4])
+    else:
+        if not upstreamOrOrginUrl:
+            print("fatal: no 'upstream' or 'origin' remote found")
+            sys.exit(1)
+        if not ghOrgSlashRepo:
+            print("fatal: no 'upstream' or 'origin' url found")
+            sys.exit(1)
+    if not prNumber.isdigit():
+        print("fatal: no usable PR number or PR URL given")
+        usage()
+
+    print("Getting data for %s PR #%s..." % (ghOrgSlashRepo, prNumber))
+    ghApiBaseUrl = "https://api.github.com/repos/%s" % (ghOrgSlashRepo)
+    prApiUrl = "%s/pulls/%s" % (ghApiBaseUrl, prNumber)
+    response = None
+    pr = None
+    try:
+        response = urllib.request.urlopen(urllib.request.Request(prApiUrl))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("fatal: no data found at %s" % prApiUrl)
+            sys.exit(1)
+    pr = json.load(response)
+
+    prAuthor = pr['user']['login']
+    prOwner = pr['head']['repo']['owner']['login']
+    prRepoUrl = pr['head']['repo']['clone_url']
+    if ghProtocolIsSsh:
+        prRepoUrl = pr['head']['repo']['ssh_url']
+    prBranch = pr['head']['ref']
+    prRefSpec = "+refs/heads/%s:refs/remotes/%s/%s" \
+        % (prBranch, prOwner, prBranch)
+
+    author = json.load(urllib.request.urlopen("https://api.github.com/users/%s"
+                                              % prAuthor))
+
+    print("")
+    print("Author: %s (%s)" % (prAuthor, author['name']))
+    print("Title:  %s" % pr['title'])
+    print("")
+
+    if (prRepoUrl == upstreamOrOrginUrl):
+        print("Fetching the '%s' branch..." % prBranch)
+        git("fetch", "origin", prBranch)
+        print(git("checkout", prBranch).decode("utf-8").strip())
+    else:
+        localBranch = "%s-%s" % (prOwner, prBranch)
+        print("Preparing for checkout into '%s' local branch." % localBranch)
+        if git("config", "branch.%s.remote" % localBranch):
+            print("fatal: there's already a '%s' branch here" % localBranch)
+            sys.exit(1)
+
+        if not git("config", "remote.%s.url" % prOwner):
+            print("Adding new remote '%s'." % prOwner)
+            git("remote", "add", "--no-tags", "-t",
+                prBranch, prOwner, prRepoUrl)
+
+        refSpecs = git("config", "--get-all", "remote.%s.fetch" % prOwner) \
+            .decode("utf-8")
+        if prRefSpec not in refSpecs:
+            print("Adding '%s' branch info to remote '%s'."
+                  % (prBranch, prOwner))
+            git("remote", "set-branches", "--add", prOwner, prBranch)
+
+        print("Fetching the '%s' branch from remote '%s'..."
+              % (prBranch, prOwner))
+        git("fetch", prOwner, prRefSpec)
+        print("Checking out into the '%s' local branch." % localBranch)
+        print(git("checkout", "-b", localBranch, "--track", "%s/%s"
+                  % (prOwner, prBranch)).decode("utf-8").strip())
+
+
+def git(cmd, *args):
+    full_cmd = ["git", cmd] + list(args)
+    try:
+        return subprocess.check_output(full_cmd, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as e:
+        if e.output.strip():
+            print(e.output)
+            sys.exit(1)
+
+
+def usage():
+    print("Usage:")
+    print("  %s PR_NUMBER | PR_URL" % sys.argv[0])
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        retcode = main()
+    except Exception:
+        raise
+    else:
+        sys.exit(retcode)
